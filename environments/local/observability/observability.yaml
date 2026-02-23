@@ -1,0 +1,13 @@
+apiVersion: platform.muller.dxp.de/v1alpha1
+kind: ObservabilityStackClaim
+metadata:
+  name: observability-local
+  namespace: dxp-local-observability
+spec:
+  namespace: dxp-local-observability
+  backend: self-hosted
+  providerConfigRef: local-cluster
+  retention:
+    metrics: "15d"
+    logs: "30d"
+    traces: "7d"
