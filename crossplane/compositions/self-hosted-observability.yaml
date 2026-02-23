@@ -1,0 +1,177 @@
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: self-hosted-observability
+  labels:
+    crossplane.io/xrd: observabilitystacks.platform.muller.dxp.de
+    provider: self-hosted
+spec:
+  compositeTypeRef:
+    apiVersion: platform.muller.dxp.de/v1alpha1
+    kind: ObservabilityStack
+  resources:
+    # --- Prometheus + Grafana + Alertmanager ---
+    - name: prometheus-stack
+      base:
+        apiVersion: helm.crossplane.io/v1beta1
+        kind: Release
+        metadata:
+          annotations:
+            crossplane.io/external-name: prometheus-stack
+        spec:
+          providerConfigRef:
+            name: local-cluster
+          forProvider:
+            chart:
+              name: kube-prometheus-stack
+              repository: https://prometheus-community.github.io/helm-charts
+              version: "65.1.0"
+            namespace: observability
+            values:
+              prometheus:
+                prometheusSpec:
+                  retention: "15d"
+                  storageSpec:
+                    volumeClaimTemplate:
+                      spec:
+                        accessModes:
+                          - ReadWriteOnce
+                        resources:
+                          requests:
+                            storage: 5Gi
+              grafana:
+                enabled: true
+                adminPassword: "platform-admin"
+                service:
+                  type: ClusterIP
+                sidecar:
+                  datasources:
+                    enabled: true
+                additionalDataSources:
+                  - name: Loki
+                    type: loki
+                    access: proxy
+                    url: http://loki-gateway:80
+                    jsonData:
+                      maxLines: 1000
+              alertmanager:
+                enabled: true
+      patches:
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.namespace
+          toFieldPath: spec.forProvider.namespace
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.providerConfigRef
+          toFieldPath: spec.providerConfigRef.name
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.retention.metrics
+          toFieldPath: spec.forProvider.values.prometheus.prometheusSpec.retention
+        - type: CombineFromComposite
+          combine:
+            variables:
+              - fromFieldPath: spec.namespace
+            strategy: string
+            string:
+              fmt: "http://loki-gateway.%s.svc.cluster.local:80"
+          toFieldPath: spec.forProvider.values.grafana.additionalDataSources[0].url
+
+    # --- Loki (log aggregation) ---
+    - name: loki
+      base:
+        apiVersion: helm.crossplane.io/v1beta1
+        kind: Release
+        metadata:
+          annotations:
+            crossplane.io/external-name: loki
+        spec:
+          providerConfigRef:
+            name: local-cluster
+          forProvider:
+            chart:
+              name: loki
+              repository: https://grafana.github.io/helm-charts
+              version: "6.16.0"
+            namespace: observability
+            values:
+              loki:
+                auth_enabled: false
+                commonConfig:
+                  replication_factor: 1
+                storage:
+                  type: filesystem
+                schemaConfig:
+                  configs:
+                    - from: "2024-04-01"
+                      store: tsdb
+                      object_store: filesystem
+                      schema: v13
+                      index:
+                        prefix: index_
+                        period: 24h
+              deploymentMode: SingleBinary
+              singleBinary:
+                replicas: 1
+                persistence:
+                  enabled: true
+                  size: 5Gi
+              gateway:
+                enabled: true
+              backend:
+                replicas: 0
+              read:
+                replicas: 0
+              write:
+                replicas: 0
+              chunksCache:
+                enabled: false
+              resultsCache:
+                enabled: false
+              monitoring:
+                selfMonitoring:
+                  enabled: false
+                lokiCanary:
+                  enabled: false
+      patches:
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.namespace
+          toFieldPath: spec.forProvider.namespace
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.providerConfigRef
+          toFieldPath: spec.providerConfigRef.name
+
+    # --- Promtail (log shipping to Loki) ---
+    - name: promtail
+      base:
+        apiVersion: helm.crossplane.io/v1beta1
+        kind: Release
+        metadata:
+          annotations:
+            crossplane.io/external-name: promtail
+        spec:
+          providerConfigRef:
+            name: local-cluster
+          forProvider:
+            chart:
+              name: promtail
+              repository: https://grafana.github.io/helm-charts
+              version: "6.16.6"
+            namespace: observability
+            values:
+              config:
+                clients:
+                  - url: "http://loki-gateway.observability.svc.cluster.local/loki/api/v1/push"
+      patches:
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.namespace
+          toFieldPath: spec.forProvider.namespace
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.providerConfigRef
+          toFieldPath: spec.providerConfigRef.name
+        - type: CombineFromComposite
+          combine:
+            variables:
+              - fromFieldPath: spec.namespace
+            strategy: string
+            string:
+              fmt: "http://loki-gateway.%s.svc.cluster.local/loki/api/v1/push"
+          toFieldPath: spec.forProvider.values.config.clients[0].url
