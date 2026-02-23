@@ -1,0 +1,53 @@
+apiVersion: apiextensions.crossplane.io/v1
+kind: CompositeResourceDefinition
+metadata:
+  name: observabilitystacks.platform.muller.dxp.de
+spec:
+  group: platform.muller.dxp.de
+  names:
+    kind: ObservabilityStack
+    plural: observabilitystacks
+  claimNames:
+    kind: ObservabilityStackClaim
+    plural: observabilitystackclaims
+  versions:
+    - name: v1alpha1
+      served: true
+      referenceable: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                namespace:
+                  type: string
+                  description: "Target namespace for the observability stack"
+                backend:
+                  type: string
+                  enum:
+                    - self-hosted
+                  default: self-hosted
+                  description: "Observability backend type"
+                providerConfigRef:
+                  type: string
+                  default: local-cluster
+                  description: "Name of the Crossplane ProviderConfig to use"
+                retention:
+                  type: object
+                  properties:
+                    metrics:
+                      type: string
+                      default: "15d"
+                      description: "Metrics retention period"
+                    logs:
+                      type: string
+                      default: "30d"
+                      description: "Logs retention period"
+                    traces:
+                      type: string
+                      default: "7d"
+                      description: "Traces retention period"
+              required:
+                - namespace
