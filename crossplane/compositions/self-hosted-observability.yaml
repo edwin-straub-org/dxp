@@ -47,6 +47,8 @@ spec:
                               resources:
                                 requests:
                                   storage: 5Gi
+                        # Enable receiving remote-write from the OTel Collector
+                        enableRemoteWriteReceiver: true
                     grafana:
                       enabled: true
                       adminPassword: "platform-admin"
@@ -62,6 +64,20 @@ spec:
                           url: http://loki-gateway:80
                           jsonData:
                             maxLines: 1000
+                        - name: Tempo
+                          type: tempo
+                          access: proxy
+                          url: http://tempo:3100
+                          jsonData:
+                            tracesToLogsV2:
+                              datasourceUid: loki
+                              filterByTraceID: true
+                            tracesToMetrics:
+                              datasourceUid: prometheus
+                            serviceMap:
+                              datasourceUid: prometheus
+                            nodeGraph:
+                              enabled: true
                     alertmanager:
                       enabled: true
             patches:
@@ -82,6 +98,14 @@ spec:
                   string:
                     fmt: "http://loki-gateway.%s.svc.cluster.local:80"
                 toFieldPath: spec.forProvider.values.grafana.additionalDataSources[0].url
+              - type: CombineFromComposite
+                combine:
+                  variables:
+                    - fromFieldPath: spec.namespace
+                  strategy: string
+                  string:
+                    fmt: "http://tempo.%s.svc.cluster.local:3100"
+                toFieldPath: spec.forProvider.values.grafana.additionalDataSources[1].url
 
           # --- Loki (log aggregation) ---
           - name: loki
@@ -147,7 +171,175 @@ spec:
                 fromFieldPath: spec.providerConfigRef
                 toFieldPath: spec.providerConfigRef.name
 
-          # --- Promtail (log shipping to Loki) ---
+          # --- Tempo (distributed tracing) ---
+          - name: tempo
+            base:
+              apiVersion: helm.crossplane.io/v1beta1
+              kind: Release
+              metadata:
+                annotations:
+                  crossplane.io/external-name: tempo
+              spec:
+                providerConfigRef:
+                  name: local-cluster
+                forProvider:
+                  chart:
+                    name: tempo
+                    repository: https://grafana.github.io/helm-charts
+                    version: "1.10.3"
+                  namespace: observability
+                  values:
+                    tempo:
+                      retention: "168h"  # 7 days
+                      storage:
+                        trace:
+                          backend: local
+                          local:
+                            path: /var/tempo/traces
+                          wal:
+                            path: /var/tempo/wal
+                      receivers:
+                        otlp:
+                          protocols:
+                            grpc:
+                              endpoint: "0.0.0.0:4317"
+                            http:
+                              endpoint: "0.0.0.0:4318"
+                      metricsGenerator:
+                        enabled: true
+                        remoteWriteUrl: "http://prometheus-stack-kube-prom-prometheus:9090/api/v1/write"
+                    persistence:
+                      enabled: true
+                      size: 5Gi
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.namespace
+                toFieldPath: spec.forProvider.namespace
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.providerConfigRef
+                toFieldPath: spec.providerConfigRef.name
+              - type: CombineFromComposite
+                combine:
+                  variables:
+                    - fromFieldPath: spec.namespace
+                  strategy: string
+                  string:
+                    fmt: "http://prometheus-stack-kube-prom-prometheus.%s.svc.cluster.local:9090/api/v1/write"
+                toFieldPath: spec.forProvider.values.tempo.metricsGenerator.remoteWriteUrl
+
+          # --- OpenTelemetry Collector (unified ingestion) ---
+          - name: otel-collector
+            base:
+              apiVersion: helm.crossplane.io/v1beta1
+              kind: Release
+              metadata:
+                annotations:
+                  crossplane.io/external-name: otel-collector
+              spec:
+                providerConfigRef:
+                  name: local-cluster
+                forProvider:
+                  chart:
+                    name: opentelemetry-collector
+                    repository: https://open-telemetry.github.io/opentelemetry-helm-charts
+                    version: "0.73.1"
+                  namespace: observability
+                  values:
+                    mode: deployment
+                    replicaCount: 1
+                    image:
+                      repository: otel/opentelemetry-collector-contrib
+                    ports:
+                      otlp:
+                        enabled: true
+                        containerPort: 4317
+                        servicePort: 4317
+                        protocol: TCP
+                      otlp-http:
+                        enabled: true
+                        containerPort: 4318
+                        servicePort: 4318
+                        protocol: TCP
+                    config:
+                      receivers:
+                        otlp:
+                          protocols:
+                            grpc:
+                              endpoint: "0.0.0.0:4317"
+                            http:
+                              endpoint: "0.0.0.0:4318"
+                      processors:
+                        batch:
+                          timeout: 5s
+                          send_batch_size: 1024
+                        memory_limiter:
+                          check_interval: 5s
+                          limit_mib: 256
+                          spike_limit_mib: 64
+                      exporters:
+                        # Metrics → Prometheus via remote write
+                        prometheusremotewrite:
+                          endpoint: "http://prometheus-stack-kube-prom-prometheus:9090/api/v1/write"
+                          resource_to_telemetry_conversion:
+                            enabled: true
+                        # Traces → Tempo via OTLP
+                        otlp/tempo:
+                          endpoint: "tempo:4317"
+                          tls:
+                            insecure: true
+                        # Logs → Loki via loki exporter
+                        loki:
+                          endpoint: "http://loki-gateway:80/loki/api/v1/push"
+                      service:
+                        pipelines:
+                          traces:
+                            receivers: [otlp]
+                            processors: [memory_limiter, batch]
+                            exporters: [otlp/tempo]
+                          metrics:
+                            receivers: [otlp]
+                            processors: [memory_limiter, batch]
+                            exporters: [prometheusremotewrite]
+                          logs:
+                            receivers: [otlp]
+                            processors: [memory_limiter, batch]
+                            exporters: [loki]
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.namespace
+                toFieldPath: spec.forProvider.namespace
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.providerConfigRef
+                toFieldPath: spec.providerConfigRef.name
+              # Patch Prometheus remote write endpoint
+              - type: CombineFromComposite
+                combine:
+                  variables:
+                    - fromFieldPath: spec.namespace
+                  strategy: string
+                  string:
+                    fmt: "http://prometheus-stack-kube-prom-prometheus.%s.svc.cluster.local:9090/api/v1/write"
+                toFieldPath: spec.forProvider.values.config.exporters.prometheusremotewrite.endpoint
+              # Patch Tempo endpoint
+              - type: CombineFromComposite
+                combine:
+                  variables:
+                    - fromFieldPath: spec.namespace
+                  strategy: string
+                  string:
+                    fmt: "tempo.%s.svc.cluster.local:4317"
+                toFieldPath: spec.forProvider.values.config.exporters.otlp/tempo.endpoint
+              # Patch Loki endpoint
+              - type: CombineFromComposite
+                combine:
+                  variables:
+                    - fromFieldPath: spec.namespace
+                  strategy: string
+                  string:
+                    fmt: "http://loki-gateway.%s.svc.cluster.local:80/loki/api/v1/push"
+                toFieldPath: spec.forProvider.values.config.exporters.loki.endpoint
+
+          # --- Promtail (node-level log shipping to Loki) ---
           - name: promtail
             base:
               apiVersion: helm.crossplane.io/v1beta1
